@@ -1,6 +1,6 @@
 import sys
 import os
-from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget, QFileDialog, QLabel, QProgressBar
+from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget, QFileDialog, QLabel, QProgressBar, QTextEdit
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
 from PyQt5.QtGui import QMovie
 from pdf2image import convert_from_path
@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import traceback
 import sqlite3
+import gc
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # spaCy modelini yükleyelim (Türkçe model)
@@ -20,7 +21,8 @@ nlp = spacy.load("tr_core_news_trf")
 class PDFConverterThread(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(str)
-    progress_value = pyqtSignal(int)  # **Her sayfanın ilerlemesini iletmek için yeni sinyal**
+    progress_value = pyqtSignal(int)  # Her sayfanın ilerlemesini iletmek için yeni sinyal
+    log_signal = pyqtSignal(str)  # Yeni log sinyali
 
     def __init__(self, pdf_path):
         super().__init__()
@@ -29,55 +31,87 @@ class PDFConverterThread(QThread):
 
     def run(self):
         try:
+            self.log_signal.emit(f"PDF işleme başlatılıyor: {os.path.basename(self.pdf_path)}")
             self.nlp = spacy.load("tr_core_news_trf")
-            images = convert_from_path(self.pdf_path)
+            self.log_signal.emit("Türkçe NLP modeli yüklendi")
             output_text = ""
 
+            # Önce toplam sayfa sayısını al
+            self.log_signal.emit("Toplam sayfa sayısı hesaplanıyor...")
+            images = convert_from_path(self.pdf_path)
             total_pages = len(images)
+            self.log_signal.emit(f"Toplam {total_pages} sayfa tespit edildi")
+            del images
+            gc.collect()
 
-            for i, image in enumerate(images):
+            # Sayfaları tek tek işle
+            for page_num in range(total_pages):
+                self.log_signal.emit(f"\nSayfa {page_num + 1} işleniyor...")
+                
+                # Her seferinde sadece bir sayfa yükle
+                self.log_signal.emit("- Sayfa yükleniyor...")
+                images = convert_from_path(self.pdf_path, first_page=page_num + 1, last_page=page_num + 1)
+                image = images[0]
+
                 # Görseli numpy array'e dönüştür
+                self.log_signal.emit("- Görsel işleniyor...")
                 img_np = np.array(image)
 
                 # Görseli gri tonlamaya çevir
+                self.log_signal.emit("- Gri tonlamaya dönüştürülüyor...")
                 gray_image = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
 
                 # Adaptive threshold uygula
+                self.log_signal.emit("- Threshold uygulanıyor...")
                 thresh_image = cv2.adaptiveThreshold(gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
 
                 # Sayfayı sütunlara ayır
+                self.log_signal.emit("- Sayfa sütunlara ayrılıyor...")
                 columns = self.split_into_columns(thresh_image)
 
                 page_text = ""
-                for col in columns:
+                self.log_signal.emit("- OCR işlemi başlatılıyor...")
+                for i, col in enumerate(columns, 1):
+                    self.log_signal.emit(f"  * Sütun {i} işleniyor...")
                     # Her sütun için OCR uygula
                     col_text = pytesseract.image_to_string(col, lang='tur')
                     cleaned_text = self.clean_text(col_text)
 
-                    # Ön işleme tabi tut (OCR hatalarını düzeltme)
+                    # Ön işleme tabi tut
                     preprocessed_text = self.preprocess_text(cleaned_text)
-
                     page_text += preprocessed_text + "\n\n"
 
-                output_text += f"Sayfa {i+1} için çıkarılan metin:\n"
+                output_text += f"Sayfa {page_num + 1} için çıkarılan metin:\n"
                 output_text += page_text + "\n\n"
 
-                # Progress signal
-                progress_percentage = int((i + 1) / total_pages * 100)
-                self.progress.emit(progress_percentage)
-                self.progress_value.emit(progress_percentage)  # **Yeni sinyal**
+                # Bellek temizliği
+                self.log_signal.emit("- Bellek temizleniyor...")
+                del images, image, img_np, gray_image, thresh_image, columns
+                gc.collect()
 
-            # Metni parse et ve veritabanına kaydet
+                # Progress
+                progress_percentage = int((page_num + 1) / total_pages * 100)
+                self.progress.emit(progress_percentage)
+                self.progress_value.emit(progress_percentage)
+                self.log_signal.emit(f"- Sayfa {page_num + 1} tamamlandı (%{progress_percentage})")
+
+            self.log_signal.emit("\nMetin analizi yapılıyor...")
             parsed_data = self.parse_text(output_text)
+            
+            self.log_signal.emit("Veritabanına kaydediliyor...")
             self.save_to_database(parsed_data)
 
             txt_path = os.path.splitext(self.pdf_path)[0] + '_ocr_results.txt'
+            self.log_signal.emit(f"Sonuçlar dosyaya yazılıyor: {os.path.basename(txt_path)}")
             with open(txt_path, 'w', encoding='utf-8') as f:
                 f.write(output_text)
+            
+            self.log_signal.emit("İşlem başarıyla tamamlandı!")
             self.finished.emit(txt_path)
 
         except Exception as e:
             error_message = f"Hata: {e}\n{traceback.format_exc()}"
+            self.log_signal.emit(f"\nHATA OLUŞTU:\n{error_message}")
             print(error_message)
             self.finished.emit(error_message)
 
@@ -283,7 +317,7 @@ class PDFConverterThread(QThread):
             persons.append(person_data)
 
         # Ayrıca, 'Kimlik Numaralı' ifadesiyle verilen kişileri yakala
-        pattern2 = r"(\d{3}\*{4,6}\d{2,3} Kimlik Numaralı)\s+([A-ZÇŞĞÜÖİ\s']+)"
+        pattern2 = r"(\d{3}\*{4,6}\d{2,3} Kimlik Numaralı)\s+([A-ZÇŞĞÜÖİ\s']+) (\d[\d\.,]+ TL) sermaye karşılığı (\d+) adet payını hukuki ve mali yükümlülükleri ile (\d{3}\*{4,6}\d{2,3} Kimlik Numaralı) ([A-ZÇŞĞÜÖİ\s']+)'e devretmiştir"
         matches2 = re.findall(pattern2, announcement_text, re.DOTALL | re.IGNORECASE)
         for match in matches2:
             person_data = {
@@ -520,12 +554,18 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PDF to Word Converter")
-        self.setGeometry(100, 100, 400, 250)
+        self.setGeometry(100, 100, 500, 600)  # Pencere boyutunu artırdık
 
+        # Ana widget için arka plan rengini ayarla
+        main_widget = QWidget()
+        main_widget.setAutoFillBackground(True)
+        
         # Layout oluşturma
         layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)  # Kenar boşlukları ekle
+        layout.setSpacing(10)  # Widget'lar arası boşluk
 
-        # Butonlar ve label ekleme
+        # Mevcut widget'lar
         self.select_button = QPushButton("PDF Dosyası Seç")
         self.select_button.clicked.connect(self.select_pdf)
         layout.addWidget(self.select_button)
@@ -541,6 +581,20 @@ class MainWindow(QMainWindow):
         self.progress_label.setVisible(False)
         layout.addWidget(self.progress_label)
 
+        # Log görüntüleme alanı
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(300)  # Minimum yükseklik
+        # Stil direkt olarak palette kullanacak şekilde değiştirildi
+        self.log_text.setStyleSheet("""
+            QTextEdit {
+                font-family: monospace;
+                font-size: 12px;
+                line-height: 1.4;
+            }
+        """)
+        layout.addWidget(self.log_text)
+
         self.open_file_button = QPushButton("Dosyayı Aç")
         self.open_file_button.clicked.connect(self.open_file)
         self.open_file_button.setVisible(False)
@@ -548,7 +602,7 @@ class MainWindow(QMainWindow):
 
         self.dancing_label = QLabel(self)
         self.dancing_label.setAlignment(Qt.AlignCenter)
-        self.movie = QMovie("path_to_gif.gif")  # Doğru yolu ekleyin
+        self.movie = QMovie("path_to_gif.gif")
         self.dancing_label.setMovie(self.movie)
         self.dancing_label.setVisible(False)
         layout.addWidget(self.dancing_label)
@@ -559,34 +613,32 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
 
         self.output_file_path = None
-
-        # Thread'leri tutmak için bir liste
         self.threads = []
-
-        # **Toplam ilerlemeyi takip etmek için değişkenler**
         self.total_progress = 0
         self.current_pdf_progress = 0
+
+    def add_log(self, message):
+        self.log_text.append(message)
+        # Otomatik olarak en alta kaydır
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum()
+        )
 
     def select_pdf(self):
         pdf_paths, _ = QFileDialog.getOpenFileNames(self, "Bir veya daha fazla PDF dosyası seçin", "", "PDF files (*.pdf)")
         if pdf_paths:
-            self.status_label.setText(f"{len(pdf_paths)} dosya seçildi")
+            self.progress_bar.setVisible(True)
+            self.progress_label.setVisible(True)
+            self.progress_bar.setValue(0)
+            self.output_file_paths = []
             self.convert_pdfs(pdf_paths)
 
     def convert_pdfs(self, pdf_paths):
-        # UI kontrolü
-        self.progress_bar.setVisible(True)
-        self.progress_label.setVisible(True)
-        self.select_button.setEnabled(False)
-        self.open_file_button.setVisible(False)
-        self.dancing_label.setVisible(True)
-        self.movie.start()
-
-        self.output_file_paths = []
+        # İlk dosyayı dönüştürmeye başla
         self.total_files = len(pdf_paths)
         self.current_file_index = 0
 
-        # **Toplam ilerlemeyi sıfırlıyoruz**
+        # Toplam ilerlemeyi sıfırlıyoruz
         self.total_progress = 0
 
         # İlk PDF dönüştürme işlemi için yeni thread başlat
@@ -595,69 +647,105 @@ class MainWindow(QMainWindow):
     def convert_pdf(self, pdf_path, pdf_paths):
         thread = PDFConverterThread(pdf_path)
         thread.progress.connect(self.update_progress)
-        # thread'i parametre olarak geçiyoruz
-        thread.finished.connect(lambda result, t=thread: self.conversion_finished(result, pdf_paths, t))
+        thread.finished.connect(lambda result: self.conversion_finished(result, pdf_paths, thread))
+        thread.log_signal.connect(self.add_log)  # Log sinyalini bağla
         thread.start()
         # Thread'i listeye ekliyoruz
         self.threads.append(thread)
 
-        # **Şu anki PDF'nin ilerlemesini sıfırlıyoruz**
+        # Şu anki PDF'nin ilerlemesini sıfırlıyoruz
         self.current_pdf_progress = 0
 
-        # **Durum bilgisini güncelliyoruz**
+        # Durum bilgisini güncelliyoruz
         self.status_label.setText(f"İşlenen dosya: {os.path.basename(pdf_path)} ({self.current_file_index + 1}/{self.total_files})")
 
     def update_progress(self, value):
-        # **Şu anki PDF'nin ilerlemesini güncelliyoruz**
+        # Şu anki PDF'nin ilerlemesini güncelliyoruz
         self.current_pdf_progress = value
 
-        # **Toplam ilerlemeyi hesaplıyoruz**
+        # Toplam ilerlemeyi hesaplıyoruz
         total_progress = ((self.current_file_index + self.current_pdf_progress / 100) / self.total_files) * 100
         self.progress_bar.setValue(int(total_progress))
         self.progress_label.setText(f"%{int(total_progress)} Tamamlandı")
 
     def conversion_finished(self, result, pdf_paths, thread):
         # Thread'i listeden kaldırıyoruz
-        self.threads.remove(thread)
+        if thread in self.threads:
+            self.threads.remove(thread)
 
         if result.endswith('.txt'):
             self.output_file_paths.append(result)
-            # **Her dosya işlendiğinde durum bilgisini güncelliyoruz**
+            # Her dosya işlendiğinde durum bilgisini güncelliyoruz
             # self.status_label.setText(f"Dönüştürme tamamlandı. Sonuç: {result}")
             self.output_file_path = result
             # self.open_file_button.setVisible(True)
+
+            # Sonraki dosyaya geç
+            self.current_file_index += 1
+            if self.current_file_index < len(pdf_paths):
+                self.convert_pdf(pdf_paths[self.current_file_index], pdf_paths)
+            else:
+                # Tüm dosyalar tamamlandı
+                self.status_label.setText("Tüm dosyalar dönüştürüldü!")
+                self.open_file_button.setVisible(True)
         else:
             self.status_label.setText(f"Hata oluştu: {result}")
-            print(result)  # Hata mesajını da ekrana yazdır
-
-        # Bir sonraki dosyayı dönüştürme
-        self.current_file_index += 1
-        if self.current_file_index < self.total_files:
-            self.convert_pdf(pdf_paths[self.current_file_index], pdf_paths)
-        else:
-            # Tüm dosyalar işlendiğinde UI elemanlarını güncelliyoruz
-            self.progress_bar.setVisible(False)
-            self.progress_label.setVisible(False)
-            self.select_button.setEnabled(True)
-            self.dancing_label.setVisible(False)
-            self.movie.stop()
-            self.status_label.setText("Tüm dosyaların dönüştürme işlemi tamamlandı.")
-            self.open_file_button.setVisible(True)
 
     def open_file(self):
-        # Çıktı dosyalarını platforma göre aç
-        if self.output_file_paths:
+        if hasattr(self, 'output_file_paths'):
             for file_path in self.output_file_paths:
-                if os.path.exists(file_path):
-                    if sys.platform == "win32":
-                        os.startfile(file_path)
-                    elif sys.platform == "darwin":
-                        subprocess.call(["open", file_path])
-                    else:
-                        subprocess.call(["xdg-open", file_path])
+                if sys.platform == "win32":
+                    os.startfile(file_path)
+                elif sys.platform == "darwin":  # macOS
+                    subprocess.call(["open", file_path])
+                else:
+                    subprocess.call(["xdg-open", file_path])
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    
+    # Genel stil ayarları
+    style = """
+    QMainWindow {
+        background-color: palette(window);
+    }
+    QPushButton {
+        background-color: palette(button);
+        border: 1px solid palette(mid);
+        border-radius: 4px;
+        padding: 5px 15px;
+        min-height: 30px;
+    }
+    QPushButton:hover {
+        background-color: palette(light);
+    }
+    QPushButton:pressed {
+        background-color: palette(mid);
+    }
+    QProgressBar {
+        border: 1px solid palette(mid);
+        border-radius: 4px;
+        text-align: center;
+    }
+    QProgressBar::chunk {
+        background-color: #2196F3;
+    }
+    QLabel {
+        color: palette(text);
+    }
+    QTextEdit {
+        background-color: palette(base);
+        color: palette(text);
+        border: 1px solid palette(mid);
+        border-radius: 4px;
+        padding: 5px;
+        font-family: monospace;
+        selection-background-color: palette(highlight);
+        selection-color: palette(highlighted-text);
+    }
+    """
+    app.setStyleSheet(style)
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
